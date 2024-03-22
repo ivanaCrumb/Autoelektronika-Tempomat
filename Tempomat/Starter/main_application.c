@@ -1,9 +1,7 @@
+
 // STANDARD INCLUDES
-#include <stdio.h>l.g 
+#include <stdio.h>
 #include <conio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <math.h>
 
 // KERNEL INCLUDES
 #include "FreeRTOS.h"
@@ -15,144 +13,467 @@
 // HARDWARE SIMULATOR UTILITY FUNCTIONS  
 #include "HW_access.h"
 
+// TASK PRIORITIES 
+#define	SERVICE_TASK_PRI		( tskIDLE_PRIORITY + 1 )
+#define	SEND_MESSAGE_PRI		( tskIDLE_PRIORITY + (UBaseType_t)2 )
+#define DISTANCE_CHECK			( tskIDLE_PRIORITY + (UBaseType_t)3 )
+#define PROCESSING_PRI			( tskIDLE_PRIORITY + (UBaseType_t)4 )
+#define RECEIVE_VALUE_PRI		( tskIDLE_PRIORITY + (UBaseType_t)5 )
+#define RECEIVE_COMMAND_PRI		( tskIDLE_PRIORITY + (UBaseType_t)6 )
+
+
+//DEFINES
+#define MAX_CHARACTERS (20)
+#define ASCII_CR (46)
+#define LENGTH_TEMPOMAT_85 (11)
+#define LENGTH_TEMPOMAT_OFF (12)
+#define DISTANCE_THRESHOLD (500)
+
+static uint8_t rezimRada = (uint8_t)0;
+
 
 // SERIAL SIMULATOR CHANNEL TO USE 
 #define COM_CH_0 (0)
-
-
-// TASK PRIORITIES 
-#define	TASK_SERIAL_SEND_PRI		( tskIDLE_PRIORITY + 2 )
-#define TASK_SERIAl_REC_PRI			( tskIDLE_PRIORITY + 3 )
-#define	SERVICE_TASK_PRI			( tskIDLE_PRIORITY + 1 )
+#define COM_CH_1 (1)
+#define COM_CH_2 (2)
 
 
 // TASKS: FORWARD DECLARATIONS 
-void LEDBar_Task(void* pvParameters);
-void SerialSend_Task(void* pvParameters);
-void SerialReceive_Task(void* pvParameters);
-
-
-// TRASNMISSION DATA - CONSTANT IN THIS APPLICATION 
-const char trigger[] = "XYZ";
-unsigned volatile t_point;
-
-
-// RECEPTION DATA BUFFER - COM 0
-#define R_BUF_SIZE (32)
-uint8_t r_buffer[R_BUF_SIZE];
-unsigned volatile r_point;
-
-
-// 7-SEG NUMBER DATABASE - ALL HEX DIGITS [ 0 1 2 3 4 5 6 7 8 9 A B C D E F ]
-static const char hexnum[] = { 0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F, 0x77, 0x7C, 0x39, 0x5E, 0x79, 0x71 };
+//void LEDBar_Task(void* pvParameters);
+static void ReceiveValueTask(void* pvParameters);
+static void ReceiveCommandTask(void* pvParameters);
+static void ProcessingDataTask(void* pvParameters);
+static void distanceCheck(void* pvParameters);
+static void speedControlTask(void* pvParameters);
+static void TimerCallback(TimerHandle_t tmH);
 
 
 // GLOBAL OS-HANDLES 
-SemaphoreHandle_t LED_INT_BinarySemaphore;
-SemaphoreHandle_t TBE_BinarySemaphore;
-SemaphoreHandle_t RXC_BinarySemaphore;
-QueueHandle_t LEDBar_Queue;
-
-
-// STRUCTURES
+static SemaphoreHandle_t LED_INT_BinarySemaphore;
+static SemaphoreHandle_t UART0_sem, UART1_sem, UART2_sem;
+static SemaphoreHandle_t Sens1_SEM, Sens2_SEM, Sens3_SEM;
+static TimerHandle_t per_TimerHandle;
+static QueueHandle_t Queue1;
+static QueueHandle_t Queue2;
+//static QueueHandle_t Queue3;
+static SemaphoreHandle_t SendInfo_BinarySemaphore;
+static SemaphoreHandle_t Display_BinarySemaphore;
+static TimerHandle_t per_TimerHandle;
 
 
 // INTERRUPTS //
-static uint32_t OnLED_ChangeInterrupt(void) {	// OPC - ON INPUT CHANGE - INTERRUPT HANDLER 
+
+static uint32_t UARTInterrupt(void) {
+//interapt samo dize flagove, a prijem i obrada podataka se vrsi u taskovima
 	BaseType_t xHigherPTW = pdFALSE;
-
-	xSemaphoreGiveFromISR(LED_INT_BinarySemaphore, &xHigherPTW);
-	portYIELD_FROM_ISR(xHigherPTW);
+	if (get_RXC_status(0) != 0) {
+		if (xSemaphoreGiveFromISR(UART0_sem, &xHigherPTW) != pdPASS) {
+			printf("Error UART0_sem\n");
+		}
+	}
+	if (get_RXC_status(1) != 0) {
+		if (xSemaphoreGiveFromISR(UART1_sem, &xHigherPTW) != pdPASS) {
+			printf("Error UART1_sem\n");
+		}
+	}
+	if (get_RXC_status(2) != 0) {
+		if (xSemaphoreGiveFromISR(UART2_sem, &xHigherPTW) != pdPASS) {
+			printf("Error UART2_sem\n");
+		}
+	}
+	portYIELD_FROM_ISR((uint32_t)xHigherPTW);
 }
-
-static uint32_t prvProcessTBEInterrupt(void) {	// TBE - TRANSMISSION BUFFER EMPTY - INTERRUPT HANDLER 
-	BaseType_t xHigherPTW = pdFALSE;
-
-	xSemaphoreGiveFromISR(TBE_BinarySemaphore, &xHigherPTW);
-	portYIELD_FROM_ISR(xHigherPTW);
-}
-
-static uint32_t prvProcessRXCInterrupt(void) {	// RXC - RECEPTION COMPLETE - INTERRUPT HANDLER 
-	BaseType_t xHigherPTW = pdFALSE;
-
-	if (get_RXC_status(0) != 0)
-		xSemaphoreGiveFromISR(RXC_BinarySemaphore, &xHigherPTW);
-
-	portYIELD_FROM_ISR(xHigherPTW);
-}
-
 
 // MAIN - SYSTEM STARTUP POINT 
 void main_demo(void) {
-	// INITIALIZATION OF THE PERIPHERALS
-	//init_7seg_comm();
-	init_LED_comm();
-	init_serial_uplink(COM_CH_0);		// inicijalizacija serijske TX na kanalu 0
-	init_serial_downlink(COM_CH_0);	// inicijalizacija serijske RX na kanalu 0
+
+	// INITIALIZATION //
+	if (init_serial_uplink(COM_CH_0) != 0) {
+		printf("Error TX_COM0_INIT\n");
+	}
+	if (init_serial_downlink(COM_CH_0) != 0) {
+		printf("Error RX_COM0_INIT\n");
+	}
+	if (init_serial_uplink(COM_CH_1) != 0) {
+		printf("Error TX_COM1_INIT\n");
+	}
+	if (init_serial_downlink(COM_CH_1) != 0) {
+		printf("Error RX_COM1_INIT\n");
+	}
+	if (init_serial_uplink(COM_CH_2) != 0) {
+		printf("Error TX_COM2_INIT\n");
+	}
+	if (init_serial_downlink(COM_CH_2) != 0) {
+		printf("Error RX_COM1_INIT\n");
+	}
 
 
-	// INTERRUPT HANDLERS
-	vPortSetInterruptHandler(portINTERRUPT_SRL_OIC, OnLED_ChangeInterrupt);		// ON INPUT CHANGE INTERRUPT HANDLER 
-	vPortSetInterruptHandler(portINTERRUPT_SRL_TBE, prvProcessTBEInterrupt);	// SERIAL TRANSMITT INTERRUPT HANDLER 
-	vPortSetInterruptHandler(portINTERRUPT_SRL_RXC, prvProcessRXCInterrupt);	// SERIAL RECEPTION INTERRUPT HANDLER 
 
-	// BINARY SEMAPHORES
-	LED_INT_BinarySemaphore = xSemaphoreCreateBinary();	// CREATE LED INTERRUPT SEMAPHORE 
-	TBE_BinarySemaphore = xSemaphoreCreateBinary();		// CREATE TBE SEMAPHORE - SERIAL TRANSMIT COMM 
-	RXC_BinarySemaphore = xSemaphoreCreateBinary();		// CREATE RXC SEMAPHORE - SERIAL RECEIVE COMM
-
-	// QUEUES
-	LEDBar_Queue = xQueueCreate(2, sizeof(uint8_t));
-
-	// TASKS 
-	xTaskCreate(SerialSend_Task, "STx", configMINIMAL_STACK_SIZE, NULL, TASK_SERIAL_SEND_PRI, NULL);	// SERIAL TRANSMITTER TASK 
-	xTaskCreate(SerialReceive_Task, "SRx", configMINIMAL_STACK_SIZE, NULL, TASK_SERIAl_REC_PRI, NULL);	// SERIAL RECEIVER TASK 
-	r_point = 0;
-	xTaskCreate(LEDBar_Task, "ST", configMINIMAL_STACK_SIZE, NULL, SERVICE_TASK_PRI, NULL);				// CREATE LED BAR TASK  
+	// SERIAL RECEPTION INTERRUPT HANDLER //
+	vPortSetInterruptHandler(portINTERRUPT_SRL_RXC, UARTInterrupt);
+	//vPortSetInterruptHandler(portINTERRUPT_SRL_OIC, OnLED_ChangeInterrupt);
 
 
-	// START SCHEDULER
+	// SEMAPHORES //
+	UART0_sem = xSemaphoreCreateBinary();
+	if (UART0_sem == NULL) {
+		printf("Error RX_SEM0_CREATE\n");
+	}
+
+	UART1_sem = xSemaphoreCreateBinary();
+	if (UART1_sem == NULL) {
+		printf("Error RX_SEM1_CREATE\n");
+	}
+
+	Sens1_SEM = xSemaphoreCreateBinary();
+	if (Sens1_SEM == NULL) {
+		printf("Error Sens1_SEM_CREATE\n");
+	}
+
+	Sens2_SEM = xSemaphoreCreateBinary();
+	if (Sens2_SEM == NULL) {
+		printf("Error Sens2_SEM_CREATE\n");
+	}
+
+	Sens3_SEM = xSemaphoreCreateBinary();
+	if (Sens3_SEM == NULL) {
+		printf("Error Sens2_SEM_CREATE\n");
+	}
+
+	//SETUP UART
+	UART0_sem = xSemaphoreCreateBinary();
+	if (UART0_sem == NULL)
+	{
+		printf("error : UART0_sem create");
+	}
+
+	UART1_sem = xSemaphoreCreateBinary();
+	if (UART1_sem == NULL)
+	{
+		printf("error : UART1_sem create");
+	}
+
+	UART2_sem = xSemaphoreCreateBinary();
+	if (UART2_sem == NULL)
+	{
+		printf("error : UART2_sem create");
+	}
+
+
+	// QUEUES //
+	Queue1 = xQueueCreate((uint8_t)10, (uint8_t)MAX_CHARACTERS * (uint8_t)sizeof(char));
+	if (Queue1 == NULL) {
+		printf("Error QUEUE1_CREATE\n");
+	}
+
+	Queue2 = xQueueCreate((uint8_t)10, (uint8_t)2 * (uint8_t)sizeof(uint8_t));
+	if (Queue2 == NULL) {
+		printf("Error QUEUE2_CREATE\n");
+	}
+
+
+
+	/*Queue3 = xQueueCreate((uint8_t)10, (uint8_t)sizeof(uint8_t));
+	if (Queue3 == NULL) {
+		printf("Error QUEUE3_CREATE\n");
+	}*/
+
+
+	// TIMERS //
+	TimerHandle_t Timer200ms = xTimerCreate(
+		NULL,
+		pdMS_TO_TICKS(2000),
+		pdTRUE,
+		NULL,
+		TimerCallback);
+	if (Timer200ms == NULL) {
+		printf("Error TIMER_CREATE\n");
+	}
+	if (xTimerStart(Timer200ms, 0) != pdPASS) {
+		printf("Error TIMER_START\n");
+	}
+
+
+	// TASKS //
+
+	BaseType_t status1;
+
+	status1 = xTaskCreate(
+		ReceiveCommandTask,
+		"prijem komande",
+		configMINIMAL_STACK_SIZE,		// nije ispostovano Directive 4.6 jer je makro definisan u drugom fajlu
+		NULL,
+		(UBaseType_t)RECEIVE_COMMAND_PRI,
+		NULL);
+	if (status1 != pdPASS) {
+		printf("Error RECEIVE_COMMAND_TASK_CREATE\n");
+	}
+
+	status1 = xTaskCreate(
+		ReceiveValueTask,
+		"prijem podataka sa senzora",
+		configMINIMAL_STACK_SIZE,		// nije ispostovano Directive 4.6 jer je makro definisan u drugom fajlu
+		NULL,
+		(UBaseType_t)RECEIVE_VALUE_PRI,
+		NULL);
+	if (status1 != pdPASS) {
+		printf("Error RECEIVE_VALUE_TASK_CREATE\n");
+	}
+
+	status1 = xTaskCreate(
+		ProcessingDataTask,
+		"obrada podataka",
+		configMINIMAL_STACK_SIZE,		// nije ispostovano Directive 4.6 jer je makro definisan u drugom fajlu
+		NULL,
+		(UBaseType_t)PROCESSING_PRI,
+		NULL);
+	if (status1 != pdPASS) {
+		printf("Error PROCESSING_DATA_TASK_CREATE\n");
+	}
+
+	status1 = xTaskCreate(
+		distanceCheck,
+		"provjera udaljenosti",
+		configMINIMAL_STACK_SIZE,		// nije ispostovano Directive 4.6 jer je makro definisan u drugom fajlu
+		NULL,
+		(UBaseType_t)DISTANCE_CHECK,
+		NULL);
+	if (status1 != pdPASS) {
+		printf("Error DISTANCE_CHECK_TASK_CREATE\n");
+	}
+
+	status1 = xTaskCreate(
+		speedControlTask,
+		"kontrola brzine",
+		configMINIMAL_STACK_SIZE,		// nije ispostovano Directive 4.6 jer je makro definisan u drugom fajlu
+		NULL,
+		(UBaseType_t)DISTANCE_CHECK,
+		NULL);
+	if (status1 != pdPASS) {
+		printf("Error DISTANCE_CHECK_TASK_CREATE\n");
+	}
+
 	vTaskStartScheduler();
-	while (1);
+	for (;;) {
+		// da bi se ispostovalo pravilo misre
+	}
+
+
 }
+
+
 
 // TASKS: IMPLEMENTATIONS
-void LEDBar_Task(void* pvParameters) {
-	uint8_t LEDsPattern;
+/*void LEDBar_Task(void* pvParameters) {
+	unsigned i;
+	uint8_t d;
 	while (1) {
-		xQueueReceive(LEDBar_Queue, &LEDsPattern, portMAX_DELAY);		
-		set_LED_BAR(0, LEDsPattern);
+		xSemaphoreTake(LED_INT_BinarySemaphore, portMAX_DELAY);
+		get_LED_BAR(0, &d);
+		i = 3;
+		do {
+			i--;
+			select_7seg_digit(i);
+			set_7seg_digit(hexnum[d % 10]);
+			d /= 10;
+		} while (i > 0);
 	}
+}*/
+
+
+// PERIODIC TIMER CALLBACK 
+static void TimerCallback(TimerHandle_t tmH) {
+	if (send_serial_character((uint8_t)COM_CH_1, (uint8_t)'T') != 0) { //ovo daje ritam aj da kazem tako
+		printf("Error SEND_TRIGGER\n");
+	}
+	vTaskDelay(pdMS_TO_TICKS(200));
 }
 
-void SerialSend_Task(void* pvParameters) {
-	t_point = 0;
-	while (1) {
-		if (t_point > (sizeof(trigger) - 1))
-			t_point = 0;
-		send_serial_character(COM_CH_0, trigger[t_point++]);
-		xSemaphoreTake(TBE_BinarySemaphore, portMAX_DELAY);// kada se koristi predajni interapt
-		//vTaskDelay(pdMS_TO_TICKS(100));// kada se koristi vremenski delay
-	}
-}
 
-void SerialReceive_Task(void* pvParameters) {
+static void ReceiveCommandTask(void* pvParameters) {
+	static char tmpString[MAX_CHARACTERS];
+	static uint8_t position = 0;
 	uint8_t cc = 0;
-	uint8_t dataToSend;
-	while (1) {
-		xSemaphoreTake(RXC_BinarySemaphore, portMAX_DELAY);// ceka na serijski prijemni interapt
-		get_serial_character(COM_CH_0, &cc);//ucitava primljeni karakter u promenjivu cc
-		printf("KANAL 0: primio karakter: %u\n", (unsigned)cc);// prikazuje primljeni karakter u cmd prompt
 
-		if (cc == 0xef) {	// EF oznacava POCETAK poruke
-			r_point = 0;
+		for (;;) {
+			if (xSemaphoreTake(UART0_sem, portMAX_DELAY) != pdTRUE) {
+				printf("Error UART0_sem\n");
+			}
+			if (get_serial_character(COM_CH_0, &cc) != 0) {
+				printf("Error GET_CHARACTER1\n");
+			}
+			if (cc == (uint8_t)ASCII_CR) {
+				tmpString[position] = '\0';
+				position = 0;
+				if (xQueueSend(Queue1, tmpString, 0) != pdTRUE) {
+					printf("Error QUEUE1_SEND\n");
+				}
+				else {
+					if (xSemaphoreGive(Sens1_SEM) != pdTRUE) {
+						printf("Error: Sens1_SEM Give\n");
+					}
+				}
+				printf("Received word: %s\n", tmpString); // Print received word
+			}
+			else if (position < (uint8_t)MAX_CHARACTERS) {
+				tmpString[position] = (char)cc;
+				position++;
+			}
+			else {
+				// Handle overflow or other cases as needed
+			}
 		}
-		else if (cc == 0xff) {	// za svaki KRAJ poruke, prikazati primljenje bajtove direktno na displeju 3-4
-			dataToSend = (uint8_t)r_buffer[0];
-			xQueueSend(LEDBar_Queue, &dataToSend, portMAX_DELAY);
+}
+
+
+
+static void ReceiveValueTask(void* pvParameters) {
+	static char tmpString[MAX_CHARACTERS];
+	static uint8_t position = 0;
+	static uint16_t* value = 0;
+	uint8_t cc = 0;
+
+	for (;;) {
+		if (xSemaphoreTake(UART1_sem, portMAX_DELAY) != pdTRUE) {
+			printf("Error UART1_sem\n");
 		}
-		else if (r_point < R_BUF_SIZE) { // pamti karaktere izmedju EF i FF
-			r_buffer[r_point++] = cc;
+
+		if (get_serial_character(COM_CH_1, &cc) != 0) {
+			printf("Error get_serial_character\n");
+		}
+
+		printf("Kanal1: %c\n", cc);
+
+		if (cc == (uint8_t)ASCII_CR) {
+			// Convert string to integer
+			value = (uint16_t)(tmpString[0] - (uint16_t)'0') * (uint16_t) 100;
+			value += (uint16_t) (tmpString[1] - (uint16_t)'0') * (uint16_t)5;
+			value += (uint16_t) (tmpString[2] - (uint16_t)'0') / (uint16_t)2;
+			tmpString[position] = '\0';
+			position = 0;
+
+			printf("Received : %d\n", value);
+
+			if (xQueueSend(Queue2, &value, 0) != pdTRUE) {
+				printf("Error QUEUE1_SEND\n");
+			}
+			else {
+				if (xSemaphoreGive(Sens2_SEM) != pdTRUE) {
+					printf("Error: Sens2_SEM Give\n");
+				}
+				if (xSemaphoreGive(Sens3_SEM) != pdTRUE) {
+					printf("Error: Sens3_SEM Give\n");
+				}
+			}
+
+		}
+
+		else if (position < (uint8_t)MAX_CHARACTERS) {
+			tmpString[position] = (char)cc;
+			position++;
+		}
+		else {
+			// Handle overflow or other cases as needed
+		}
+
+		
+
+	}
+}
+
+static void ProcessingDataTask(void* pvParameters) {
+	static char tmpString[MAX_CHARACTERS];
+	static uint8_t state = (uint8_t)0;
+
+	for (;;) {
+		if (xSemaphoreTake(Sens1_SEM, portMAX_DELAY/*pdMS_TO_TICKS(3000) */) != pdTRUE) {
+			printf("Error: Sens1_SEM Receive\n");
+		}
+		if (xQueueReceive(Queue1, tmpString, portMAX_DELAY) != pdTRUE) {
+			printf("Error QUEUE1_RECEIVE\n");
+		}
+		else if (memcmp(tmpString, "TEMPOMAT_85.", LENGTH_TEMPOMAT_85) == 0) {
+			state = (uint8_t)0;
+		}
+		else if (memcmp(tmpString, "TEMPOMAT_OFF.", LENGTH_TEMPOMAT_OFF) == 0) {
+			state = (uint8_t)1;
+		}
+		else {
+			printf("Doslo je do greske!\n");
+			continue; // Preskace ostatak petlje i prelazi na sledecu iteraciju
+		}
+
+		if (state == (uint8_t)0) {
+			rezimRada = (uint8_t)0;
+			printf("Tempomat: UKLJUCEN\n");
+			printf("Brzina: 85 km/h\n");
+		}
+		else if (state == (uint8_t)1) {
+			rezimRada = (uint8_t)1;
+			printf("Tempomat: ISKLJUCEN\n");
 		}
 	}
+}
+
+static void distanceCheck(void* pvParameters) {
+	static char tmpString[MAX_CHARACTERS];
+	static uint16_t udaljenost = (uint16_t)0;
+
+	for (;;) {
+		if (xSemaphoreTake(Sens2_SEM, portMAX_DELAY/*pdMS_TO_TICKS(3000) */) != pdTRUE) {
+			printf("Error: Sens2_SEM Receive\n");
+		}
+		if (xQueuePeek(Queue2, &udaljenost, portMAX_DELAY) != pdTRUE) {
+			printf("Error QUEUE2_RECEIVE\n");
+		}
+		if (udaljenost < 500) {
+			printf("Auto ispred\n");
+		}
+		else {
+			printf("Dozvoljena udaljenost\n");
+		}
+	}
+}
+
+
+static void speedControlTask(void* pvParameters) {
+	uint32_t udaljenost1 = 0;
+	static uint8_t currentSpeed = 85; // Initial speed in km/h (dummy value)
+
+	for (;;) {
+		if (xSemaphoreTake(Sens3_SEM, portMAX_DELAY/*pdMS_TO_TICKS(3000) */) != pdTRUE) {
+			printf("Error: Sens3_SEM Receive\n");
+		}
+		// Receive distance data from the queue
+		if (xQueueReceive(Queue2, &udaljenost1, portMAX_DELAY) != pdTRUE) {
+			printf("Error receiving distance data from queue\n");
+		}
+
+		// Adjust speed based on distance
+		if (udaljenost1 < 500) {
+			// Decrease speed if distance is less than threshold
+			if (currentSpeed > 0) {
+				currentSpeed -= 1;
+				//vTaskDelay(pdMS_TO_TICKS(3000));
+			}
+
+			printf("C: %d \n", udaljenost1);
+			
+		}
+
+			else {
+				// Increase speed if distance is greater than or equal to threshold
+				if (currentSpeed < 85) { // Maximum speed is set to 85 km/h
+					currentSpeed += 1;
+					//vTaskDelay(pdMS_TO_TICKS(3000));
+				}
+			}
+		
+
+		// Print current speed
+		printf("Current speed: %d km/h\n", currentSpeed);
+
+
+	}
+
 }
